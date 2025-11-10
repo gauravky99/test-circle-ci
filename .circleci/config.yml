@@ -1,0 +1,132 @@
+version: 2.1
+
+# ---- Executors ----
+executors:
+  docker-default:
+    docker:
+      - image: cimg/base:stable   # minimal, fast
+
+# ---- Commands (helpers) ----
+commands:
+  compute-tags:
+    steps:
+      - run:
+          name: Compute image tags
+          command: |
+            # short SHA
+            echo "export GIT_SHA=$(git rev-parse --short HEAD)" >> $BASH_ENV
+            # sanitize branch name for tags (replace invalid chars with '-')
+            if [ -n "${CIRCLE_BRANCH}" ]; then
+              SANITIZED=$(echo "${CIRCLE_BRANCH}" | tr '/:@' '---' | tr -c 'A-Za-z0-9_.-' '-')
+              echo "export BRANCH_TAG=${SANITIZED}" >> $BASH_ENV
+            fi
+            # if a git tag build, use that as TAG_NAME
+            if [ -n "${CIRCLE_TAG}" ]; then
+              echo "export TAG_NAME=${CIRCLE_TAG}" >> $BASH_ENV
+            fi
+            source $BASH_ENV
+            echo "GIT_SHA=$GIT_SHA  BRANCH_TAG=$BRANCH_TAG  TAG_NAME=$TAG_NAME"
+
+  docker-login:
+    steps:
+      - run:
+          name: Login to Docker Hub
+          command: |
+            if [ -z "${DOCKER_USERNAME}" ] || [ -z "${DOCKER_PASSWORD}" ] || [ -z "${DOCKER_IMAGE}" ]; then
+              echo "DOCKER_* variables are missing. Set DOCKER_USERNAME, DOCKER_PASSWORD, DOCKER_IMAGE in CircleCI project settings." >&2
+              exit 1
+            fi
+            echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+
+# ---- Jobs ----
+jobs:
+  build_only:
+    executor: docker-default
+    steps:
+      - checkout
+      - compute-tags
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Docker build (no push)
+          command: |
+            source $BASH_ENV
+            docker build \
+              --pull \
+              -t "$DOCKER_IMAGE:ci-${GIT_SHA}" \
+              -t "$DOCKER_IMAGE:ci-${BRANCH_TAG:-local}" \
+              .
+
+  build_and_push:
+    executor: docker-default
+    steps:
+      - checkout
+      - compute-tags
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - docker-login
+      - run:
+          name: Docker build (final tags)
+          command: |
+            source $BASH_ENV
+            # Always tag with SHA
+            TAGS="-t $DOCKER_IMAGE:${GIT_SHA}"
+            # Tag with branch name on branch builds
+            if [ -n "$BRANCH_TAG" ]; then
+              TAGS="$TAGS -t $DOCKER_IMAGE:${BRANCH_TAG}"
+            fi
+            # Tag with the git tag on release builds
+            if [ -n "$TAG_NAME" ]; then
+              TAGS="$TAGS -t $DOCKER_IMAGE:${TAG_NAME}"
+            fi
+            # Also tag 'latest' for main
+            if [ "$CIRCLE_BRANCH" = "main" ]; then
+              TAGS="$TAGS -t $DOCKER_IMAGE:latest"
+            fi
+            echo "Building image with tags: $TAGS"
+            docker build --pull $TAGS .
+
+      - run:
+          name: Push images
+          command: |
+            source $BASH_ENV
+            docker push "$DOCKER_IMAGE:${GIT_SHA}"
+            if [ -n "$BRANCH_TAG" ]; then
+              docker push "$DOCKER_IMAGE:${BRANCH_TAG}"
+            fi
+            if [ -n "$TAG_NAME" ]; then
+              docker push "$DOCKER_IMAGE:${TAG_NAME}"
+            fi
+            if [ "$CIRCLE_BRANCH" = "main" ]; then
+              docker push "$DOCKER_IMAGE:latest"
+            fi
+
+# ---- Workflows ----
+workflows:
+  version: 2
+  ci:
+    jobs:
+      # Pull Requests: build but DO NOT push
+      - build_only:
+          filters:
+            branches:
+              ignore: main    # PRs and feature branches hit this
+            tags:
+              ignore: /.*/    # never run on tag with this job
+
+      # Main branch: build and push (latest, sha, branch)
+      - build_and_push:
+          filters:
+            branches:
+              only: main
+            tags:
+              ignore: /.*/
+
+      # Git tags (releases): build and push with the tag
+      - build_and_push:
+          name: build_and_push_on_tag
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /.*/      # any tag, e.g., v1.2.3
